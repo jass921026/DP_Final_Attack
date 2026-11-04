@@ -1,0 +1,39 @@
+{
+  "name": "imprint_pre_sparse_fedsgd",
+  "_comment": "Imprint attack, sparse block, FedSGD; pretrained ResNet-18.",
+  "data": {
+    "module": "datasets.imagenet_val",
+    "type": "ImageNetVal",
+    "kwargs": {
+      "root": "../imprint_attack/data/imagenet/data",
+      "n": 64,
+      "seed": 0,
+      "unique_labels": true
+    }
+  },
+  "model": {
+    "module": "models.resnet",
+    "type": "ResNet18",
+    "kwargs": {
+      "seed": 0,
+      "pretrained": true
+    }
+  },
+  "block": {
+    "type": "SparseImprintBlock",
+    "connection": "linear",
+    "gain": 1.0,
+    "linfunc": "fourier",
+    "mode": 32
+  },
+  "sweep": {
+    "num_bins": [
+      128
+    ]
+  },
+  "micro_batch": 8,
+  "iip": true,
+  "client": {
+    "type": "fedsgd"
+  }
+}

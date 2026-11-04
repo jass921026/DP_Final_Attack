@@ -1,0 +1,64 @@
+{
+  "name": "rmia_cifar10_small",
+  "_comment": "RMIA pipeline with a small CNN on CIFAR-10: 9 complementary model pairs (18 models), each trained on 25000 of the 50000 train images; audit set 20000 (balanced for target 0), population = 10000 test images; 4 target models.",
+  "official_attacks_path": "../rmia/ml_privacy_meter/attacks.py",
+  "data": {
+    "module": "datasets.cifar10",
+    "type": "CIFAR10",
+    "kwargs": {
+      "cache_dir": "data_cache"
+    }
+  },
+  "model": {
+    "module": "models.small_cnn",
+    "type": "SmallCNN",
+    "kwargs": {
+      "width": 64,
+      "num_classes": 10
+    }
+  },
+  "train": {
+    "epochs": 20,
+    "lr": 0.05,
+    "batch_size": 256,
+    "momentum": 0.9,
+    "weight_decay": 0.0,
+    "device": "mps"
+  },
+  "models": {
+    "num_pairs": 9,
+    "seed": 0
+  },
+  "audit": {
+    "size": 20000,
+    "seed": 1
+  },
+  "population": {
+    "size": 10000,
+    "seed": 2
+  },
+  "attack": {
+    "targets": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "num_ref": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "gamma": [
+      1.0,
+      2.0
+    ],
+    "a": [
+      0.3,
+      "tune"
+    ],
+    "selection": "master",
+    "check_official": true
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "name": "balle_abl_unknown_init",
+  "_comment": "Balle reconstruction, reduced scale (2000 shadow models, 100 reconstructor epochs): per-model random initialisation (adversary does not know the initial parameters).",
+  "device": "mps",
+  "data": {
+    "module": "datasets.mnist",
+    "type": "MNIST",
+    "kwargs": {
+      "cache_dir": "data_cache"
+    }
+  },
+  "splits": {
+    "seed": 42,
+    "sizes": {
+      "eval": 1000,
+      "test_targets": 1000,
+      "fixed": 1000,
+      "shadow": 2000
+    }
+  },
+  "released_model": {
+    "module": "models.mlp",
+    "type": "MLP",
+    "kwargs": {
+      "in_dim": 784,
+      "hidden": [
+        10
+      ],
+      "out_dim": 10,
+      "activation": "elu",
+      "init": "haiku"
+    }
+  },
+  "algorithm_A": {
+    "lr": 0.1,
+    "momentum": 0.9,
+    "epochs": 100,
+    "init_seed": 42,
+    "chunk_size": 500,
+    "init": "per_model"
+  },
+  "reconstructor": {
+    "model": {
+      "module": "models.mlp",
+      "type": "MLP",
+      "kwargs": {
+        "hidden": [
+          1000,
+          1000
+        ],
+        "activation": "relu",
+        "init": "haiku"
+      }
+    },
+    "lr": 0.0003,
+    "batch_size": 32,
+    "epochs": 100,
+    "seed": 42,
+    "fit_scaler_on_train_only": true,
+    "optimizer": "optax_rmsprop"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "name": "imprint_noise_A_official_select",
+  "_comment": "Imprint attack under Laplace gradient noise, IIP metric. Block A: addition connection, gain 1e-3; official selection (bias != 0, then weight reduction).",
+  "data": {
+    "module": "datasets.imagenet_val",
+    "type": "ImageNetVal",
+    "kwargs": {
+      "root": "../imprint_attack/data/imagenet/data",
+      "n": 64,
+      "seed": 0,
+      "unique_labels": true
+    }
+  },
+  "model": {
+    "module": "models.resnet",
+    "type": "ResNet18",
+    "kwargs": {
+      "seed": 0,
+      "pretrained": false
+    }
+  },
+  "block": {
+    "connection": "addition",
+    "gain": 0.001,
+    "linfunc": "fourier",
+    "mode": 32
+  },
+  "sweep": {
+    "num_bins": [
+      128
+    ],
+    "noise": [
+      0,
+      1e-07,
+      1e-06,
+      1e-05,
+      0.0001,
+      0.001,
+      0.01
+    ]
+  },
+  "micro_batch": 8,
+  "iip": true
+}

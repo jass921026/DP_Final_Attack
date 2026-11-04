@@ -1,0 +1,40 @@
+{
+  "name": "imprint_pre_fedsgd_bins",
+  "_comment": "Imprint attack, FedSGD, sweep over the number of bins; pretrained ResNet-18 (torchvision IMAGENET1K_V1).",
+  "data": {
+    "module": "datasets.imagenet_val",
+    "type": "ImageNetVal",
+    "kwargs": {
+      "root": "../imprint_attack/data/imagenet/data",
+      "n": 64,
+      "seed": 0,
+      "unique_labels": true
+    }
+  },
+  "model": {
+    "module": "models.resnet",
+    "type": "ResNet18",
+    "kwargs": {
+      "seed": 0,
+      "pretrained": true
+    }
+  },
+  "block": {
+    "connection": "addition",
+    "gain": 0.001,
+    "linfunc": "fourier",
+    "mode": 32
+  },
+  "sweep": {
+    "num_bins": [
+      16,
+      32,
+      64,
+      128,
+      156,
+      256,
+      512
+    ]
+  },
+  "micro_batch": 8
+}

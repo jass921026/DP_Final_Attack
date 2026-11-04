@@ -1,0 +1,42 @@
+{
+  "name": "imprint_sparse_fedavg_8x8_lr1e-4",
+  "_comment": "Imprint attack, sparse block (128 bins, linear connection, gain 1.0), FedAvg with 8 local steps x 8 images, lr 1e-4, local update in float32. Random-init ResNet-18.",
+  "data": {
+    "module": "datasets.imagenet_val",
+    "type": "ImageNetVal",
+    "kwargs": {
+      "root": "../imprint_attack/data/imagenet/data",
+      "n": 64,
+      "seed": 0,
+      "unique_labels": true
+    }
+  },
+  "model": {
+    "module": "models.resnet",
+    "type": "ResNet18",
+    "kwargs": {
+      "seed": 0,
+      "pretrained": false
+    }
+  },
+  "block": {
+    "type": "SparseImprintBlock",
+    "connection": "linear",
+    "gain": 1.0,
+    "linfunc": "fourier",
+    "mode": 32
+  },
+  "sweep": {
+    "num_bins": [
+      128
+    ]
+  },
+  "micro_batch": 8,
+  "iip": true,
+  "client": {
+    "type": "fedavg",
+    "steps": 8,
+    "per_step": 8,
+    "lr": 0.0001
+  }
+}

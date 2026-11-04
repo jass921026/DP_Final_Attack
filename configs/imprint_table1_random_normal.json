@@ -1,0 +1,36 @@
+{
+  "name": "imprint_table1_random_normal",
+  "_comment": "Imprint linear-function / bin-distribution ablation (random Gaussian vector + normal bins). 64 images, 128 bins, FedSGD, addition connection, gain 1e-3, random-init ResNet-18.",
+  "data": {
+    "module": "datasets.imagenet_val",
+    "type": "ImageNetVal",
+    "kwargs": {
+      "root": "../imprint_attack/data/imagenet/data",
+      "n": 64,
+      "seed": 0,
+      "unique_labels": true
+    }
+  },
+  "model": {
+    "module": "models.resnet",
+    "type": "ResNet18",
+    "kwargs": {
+      "seed": 0,
+      "pretrained": false
+    }
+  },
+  "block": {
+    "connection": "addition",
+    "gain": 0.001,
+    "linfunc": "randn",
+    "mode": 0,
+    "bin_dist": "normal"
+  },
+  "sweep": {
+    "num_bins": [
+      128
+    ]
+  },
+  "micro_batch": 8,
+  "iip": true
+}

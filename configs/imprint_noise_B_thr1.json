@@ -1,0 +1,46 @@
+{
+  "name": "imprint_noise_B_thr1",
+  "_comment": "Imprint attack under Laplace gradient noise, IIP metric. Block B: linear connection, gain 1.0; noise-aware validity threshold (1 x 2 sigma).",
+  "data": {
+    "module": "datasets.imagenet_val",
+    "type": "ImageNetVal",
+    "kwargs": {
+      "root": "../imprint_attack/data/imagenet/data",
+      "n": 64,
+      "seed": 0,
+      "unique_labels": true
+    }
+  },
+  "model": {
+    "module": "models.resnet",
+    "type": "ResNet18",
+    "kwargs": {
+      "seed": 0,
+      "pretrained": false
+    }
+  },
+  "block": {
+    "connection": "linear",
+    "gain": 1.0,
+    "linfunc": "fourier",
+    "mode": 32
+  },
+  "sweep": {
+    "num_bins": [
+      128
+    ],
+    "noise": [
+      0,
+      0.001,
+      0.003,
+      0.01,
+      0.03
+    ]
+  },
+  "micro_batch": 8,
+  "iip": true,
+  "attack": {
+    "bias_threshold_sd": 1.0,
+    "reduction": "weight"
+  }
+}
