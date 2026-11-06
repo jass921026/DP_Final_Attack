@@ -84,7 +84,15 @@ def build_signals(cfg: Dict[str, Any], root: str) -> RunRecord:
     sig = np.zeros((len(audit_idx), M), np.float32)
     pop = np.zeros((len(pop_idx), M), np.float32)
     tr_acc, te_acc = np.zeros(M), np.zeros(M)
-    for j in range(M):
+    # 逐模型檢查點：中斷（如 Colab 斷線）後從已完成的模型接續；只在規格相同時才會讀到（目錄由 spec 雜湊決定）
+    os.makedirs(d, exist_ok=True)
+    part = os.path.join(d, "partial.npz")
+    done = 0
+    if os.path.exists(part):
+        z = np.load(part)
+        done = int(z["done"]); sig, pop, tr_acc, te_acc = z["sig"], z["pop"], z["tr_acc"], z["te_acc"]
+        print(f"resume from model {done}/{M}", flush=True)
+    for j in range(done, M):
         t0 = time.time()
         keep = np.where(mem_full[:, j])[0]
         # [對應 Pseudo code: theta_j <- Trainer(...).fit()] 先固定種子再建模型（初始化由種子決定）
@@ -99,6 +107,7 @@ def build_signals(cfg: Dict[str, Any], root: str) -> RunRecord:
         tr_acc[j] = float((p_tr > 0.5).mean())                       # 以「真實類別機率>0.5」近似正確（二者在多數情形等價）
         te_acc[j] = float((pop[:, j] > 0.5).mean())
         print(f"model {j + 1}/{M} trained+signals in {time.time() - t0:.0f}s  train(p>.5) {tr_acc[j]:.3f}  test(p>.5) {te_acc[j]:.3f}", flush=True)
+        np.savez(part, done=j + 1, sig=sig, pop=pop, tr_acc=tr_acc, te_acc=te_acc)
     return RunRecord.save(d, spec, {"signals": sig.astype(np.float64), "pop_signals": pop.astype(np.float64),
                                     "memberships": mem_full[audit_idx], "audit_idx": audit_idx, "train_acc": tr_acc, "test_acc": te_acc})
 
