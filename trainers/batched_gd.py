@@ -20,7 +20,8 @@
     params.shape   # (len(Zx), n_params)  每列 = 一個模型展平後的參數（順序同 model.parameters()）
 快速路徑：模型為 models.mlp.MLP 時，改用手寫的批次矩陣乘法（固定集只做一次 GEMM，不為每個模型複製），
 記憶體與時間都遠低於 vmap 版本；數學上與 vmap 版本相同（tests/test_batched_gd.py 比對兩者）。vmap 版本是通用的參考實作。
-DP 版本（逐樣本裁剪 + 高斯雜訊，Opacus 驗證）是下一個里程碑，現在傳入 dp 會明確報錯。
+DP-GD 版本（dp={"clip": C, "sigma": 噪音倍數, "seed": 整數}）：每步 g <- (sum_i clip_C(g_i) + N(0, (sigma C)^2 I)) / (n+1)（全批次、無子抽樣、add/remove 鄰接），
+只在 MLP 快速路徑提供（逐樣本梯度範數用「幽靈範數」：||dW_i||^2 = ||delta_i||^2 ||a_i||^2，不實體化逐樣本梯度；tests/test_dp_gd.py 以 vmap 逐樣本梯度與 Opacus 驗證）。
 """
 from typing import Any, Dict, Optional
 
@@ -96,6 +97,78 @@ def _mlp_fast_loss(params: Dict[str, torch.Tensor], act: torch.nn.Module, loss_f
     return (ce_fixed + ce_z) / (n + 1)
 
 
+def _mlp_dp_grads(params: Dict[str, torch.Tensor], act: torch.nn.Module, loss_fn: torch.nn.Module, fixed_x: torch.Tensor,
+                  fixed_y: torch.Tensor, z_x: torch.Tensor, z_y: torch.Tensor, clip: float, sigma: float,
+                  gen: Optional[torch.Generator]) -> Dict[str, torch.Tensor]:
+    """
+    功能
+        MLP 專用的 DP-GD 梯度：B 個模型各自在 D- ∪ {z_b} 上的「逐樣本裁剪後加總，加高斯雜訊，除以 (n+1)」。
+    Pseudo code (DP-GD，全批次；Abadi 2016 去掉子抽樣；與 Balle 2022 Sec. VI-D 的 DP-GD 相同)
+        for each model b, each sample i in D- ∪ {z_b}:   g_i <- grad_theta CE(f_theta(x_i), y_i)
+            c_i <- min(1, clip / ||g_i||_2)                 # ||g_i||^2 = sum_l ||delta_{l,i}||^2 (1 + ||a_{l-1,i}||^2)
+        G_b <- ( sum_i c_i g_i + N(0, (sigma * clip)^2 I) ) / (n + 1)
+    用法
+        由 train_models_batched 在 dp 不為 None 時呼叫；回傳 dict，形狀同 params。sigma=0 即只裁剪。
+    """
+    n, B = fixed_x.shape[0], z_x.shape[0]
+    idx = sorted({int(k.split(".")[1]) for k in params})
+    L = len(idx)
+    W = [params[f"net.{i}.weight"].detach() for i in idx]
+    bs = [params[f"net.{i}.bias"].detach() for i in idx]
+
+    def forward(shared: bool):
+        hs, acts, a = [], [], None
+        for pos in range(L):
+            if pos == 0 and shared:
+                h = (fixed_x @ W[0].reshape(-1, W[0].shape[-1]).T).reshape(n, B, -1).permute(1, 0, 2) + bs[0][:, None, :]
+                acts.append(fixed_x)
+            elif pos == 0:
+                h = torch.einsum("bi,boi->bo", z_x, W[0])[:, None, :] + bs[0][:, None, :]
+                acts.append(z_x[:, None, :])
+            else:
+                h = torch.baddbmm(bs[pos][:, None, :], a, W[pos].transpose(1, 2))
+                acts.append(a)
+            if pos == 0:
+                h = h.detach().requires_grad_(True)          # 葉節點：之後對它求 delta
+            hs.append(h)
+            a = act(h) if pos < L - 1 else None
+        return hs, acts
+
+    with torch.enable_grad():
+        hs_f, acts_f = forward(True)
+        hs_z, acts_z = forward(False)
+        total = loss_fn.per_sample(hs_f[-1].reshape(B * n, -1), fixed_y.repeat(B)).sum() + loss_fn.per_sample(hs_z[-1].reshape(B, -1), z_y).sum()
+        deltas = torch.autograd.grad(total, hs_f + hs_z)
+    d_f, d_z = deltas[:L], deltas[L:]
+    # [對應 Pseudo code: ||g_i||^2] 逐樣本梯度範數（幽靈範數）
+    a_f = [acts_f[0]] + [t.detach() for t in acts_f[1:]]
+    a_z = [acts_z[0]] + [t.detach() for t in acts_z[1:]]
+    sq_f = torch.zeros(B, n, device=fixed_x.device); sq_z = torch.zeros(B, 1, device=fixed_x.device)
+    for l in range(L):
+        an_f = (a_f[l] ** 2).sum(-1) if l > 0 else (a_f[0] ** 2).sum(-1)[None, :]
+        sq_f = sq_f + (d_f[l] ** 2).sum(-1) * (1 + an_f)
+        sq_z = sq_z + (d_z[l] ** 2).sum(-1) * (1 + (a_z[l] ** 2).sum(-1))
+    c_f = (clip / (sq_f.sqrt() + 1e-12)).clamp(max=1.0)
+    c_z = (clip / (sq_z.sqrt() + 1e-12)).clamp(max=1.0)
+    # [對應 Pseudo code: sum_i c_i g_i] 以加權的 delta 做一次 GEMM，不實體化逐樣本梯度
+    out = {}
+    for l, i in enumerate(idx):
+        cd_f, cd_z = c_f[..., None] * d_f[l], c_z[..., None] * d_z[l]
+        if l == 0:
+            gW = torch.einsum("bno,ni->boi", cd_f, a_f[0]) + torch.einsum("bno,bni->boi", cd_z, a_z[0])
+        else:
+            gW = torch.einsum("bno,bni->boi", cd_f, a_f[l]) + torch.einsum("bno,bni->boi", cd_z, a_z[l])
+        gb = cd_f.sum(1) + cd_z.sum(1)
+        out[f"net.{i}.weight"], out[f"net.{i}.bias"] = gW, gb
+    # [對應 Pseudo code: N(0, (sigma clip)^2) 與除以 (n+1)]
+    for k in out:
+        if sigma > 0:
+            noise = torch.randn(out[k].shape, generator=gen, dtype=out[k].dtype).to(out[k].device)
+            out[k] = out[k] + sigma * clip * noise
+        out[k] = out[k] / (n + 1)
+    return out
+
+
 def train_models_batched(
     model_spec: Dict[str, Any],
     init_seed: int,
@@ -130,8 +203,8 @@ def train_models_batched(
         init_seeds=None：所有模型共用 init_seed 的初始參數（對手知道初始化，論文預設）；
         給定長度 = 模型數的整數陣列：第 i 個模型用 init_seeds[i] 各自初始化（論文 Table II「Adversary does not know initial parameters」）。
     """
-    if dp is not None:
-        raise NotImplementedError("DP-GD (per-sample clipping + noise, validated against Opacus) is the next milestone.")
+    if dp is not None and not (fast if fast is not None else (model_spec.get("module") == "models.mlp" and model_spec.get("type") == "MLP")):
+        raise NotImplementedError("DP-GD is only implemented for the MLP fast path.")
 
     # [對應 Pseudo code: theta_0 <- init(init_seed)] 以固定種子建立基底模型，所有模型共用其初始參數
     torch.manual_seed(init_seed)
@@ -167,13 +240,19 @@ def train_models_batched(
         vel = {k: torch.zeros_like(v) for k, v in params.items()}
         if use_fast:
             # [對應 Pseudo code: repeat epochs 次] 全批次更新（快速路徑：autograd 對「總和損失」求導）
+            gen = torch.Generator().manual_seed(int(dp.get("seed", 0)) * 1_000_003 + s) if dp is not None else None
             for _ in range(epochs):
-                leaves = {k: v.detach().requires_grad_(True) for k, v in params.items()}
-                with torch.enable_grad():
-                    total = _mlp_fast_loss(leaves, act, loss_fn, fx, fy, zx, zy)
-                    gs = torch.autograd.grad(total, list(leaves.values()))
+                if dp is not None:
+                    gd = _mlp_dp_grads(params, act, loss_fn, fx, fy, zx, zy, float(dp["clip"]), float(dp.get("sigma", 0.0)), gen)
+                    gs, keys = [gd[k] for k in params], list(params)
+                else:
+                    leaves = {k: v.detach().requires_grad_(True) for k, v in params.items()}
+                    with torch.enable_grad():
+                        total = _mlp_fast_loss(leaves, act, loss_fn, fx, fy, zx, zy)
+                        gs = torch.autograd.grad(total, list(leaves.values()))
+                    keys = list(leaves)
                 with torch.no_grad():
-                    for k, g_k in zip(leaves, gs):
+                    for k, g_k in zip(keys, gs):
                         vel[k] = g_k + momentum * vel[k]            # v <- g + momentum * v
                         params[k] = params[k] - lr * vel[k]         # theta <- theta - lr * v
             out.append(torch.cat([params[k].reshape(b, -1) for k in theta0], dim=1).cpu())

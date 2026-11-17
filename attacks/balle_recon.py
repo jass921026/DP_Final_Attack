@@ -146,6 +146,30 @@ def _init_seeds(A: Dict[str, Any], n: int, role: str):
     return base + np.arange(n)
 
 
+def _dp_for(A: Dict[str, Any], role: str):
+    """功能：演算法 A 的 DP 設定（A["dp"] = {"clip", "sigma", "seed"}）；影子與釋出模型用不同的雜訊種子（各自獨立抽雜訊）。無 DP 回傳 None。"""
+    dp = A.get("dp")
+    if dp is None:
+        return None
+    return {**dp, "seed": int(dp.get("seed", 0)) + (0 if role == "shadow" else 7919)}
+
+
+def dp_epsilon(A: Dict[str, Any], delta: float = 1e-5):
+    """功能：全批次 Gaussian DP-GD 的精確 (eps, delta)（無子抽樣；T 步組合成 mu-GDP，mu = sqrt(T) / sigma；add/remove 鄰接）。無 DP 回傳 None。"""
+    dp = A.get("dp")
+    if dp is None:
+        return None
+    sigma = float(dp.get("sigma", 0.0))
+    if sigma <= 0:
+        return float("inf")
+    import math
+    from scipy.optimize import brentq
+    from scipy.stats import norm
+    mu = math.sqrt(A["epochs"]) / sigma
+    f = lambda e: norm.cdf(-e / mu + mu / 2) - math.exp(min(e + norm.logcdf(-e / mu - mu / 2), 700)) - delta
+    return 0.0 if f(0) <= 0 else float(brentq(f, 0, 1e9))
+
+
 def build_attack_training_data(cfg: Dict[str, Any], x: np.ndarray, y: np.ndarray, splits: Dict[str, np.ndarray],
                                root: str = "runs") -> RunRecord:
     """
@@ -165,7 +189,7 @@ def build_attack_training_data(cfg: Dict[str, Any], x: np.ndarray, y: np.ndarray
     A = cfg["algorithm_A"]
     # [對應 Pseudo code: spec] 影響結果的一切都放進 spec，雜湊後決定能否復用
     spec = {"kind": "balle_shadow", "data": cfg["data"], "splits_seed": cfg["splits"]["seed"], "splits_sizes": cfg["splits"]["sizes"],
-            "model": cfg["released_model"], "A": {**{k: A[k] for k in ("lr", "momentum", "epochs", "init_seed")}, "init": A.get("init", "shared")}, "loss": A.get("loss", CE_SPEC), "role": "shadow"}
+            "model": cfg["released_model"], "A": {**{k: A[k] for k in ("lr", "momentum", "epochs", "init_seed")}, "init": A.get("init", "shared")}, "loss": A.get("loss", CE_SPEC), "role": "shadow", **({"dp": A["dp"]} if A.get("dp") else {})}
     d = RunRecord.dir_for(root, spec, tag="balle_shadow")
     # [對應 Pseudo code: if 已存在 -> 復用]
     if RunRecord.exists_for_spec(root, spec, tag="balle_shadow"):
@@ -175,7 +199,7 @@ def build_attack_training_data(cfg: Dict[str, Any], x: np.ndarray, y: np.ndarray
     sh_x, sh_y = x[splits["shadow"]], y[splits["shadow"]]
     params = train_models_batched(cfg["released_model"], A["init_seed"], fixed_x, fixed_y, sh_x, sh_y,
                                   A["lr"], A["momentum"], A["epochs"], build(A.get("loss", CE_SPEC)), A.get("chunk_size", 50), cfg.get("device", "cpu"),
-                                  init_seeds=_init_seeds(A, len(sh_x), role="shadow"))
+                                  init_seeds=_init_seeds(A, len(sh_x), role="shadow"), dp=_dp_for(A, "shadow"))
     # [對應 Pseudo code: 存成 RunRecord]
     return RunRecord.save(d, spec, {"params": params, "targets": sh_x, "labels": sh_y})
 
@@ -208,7 +232,7 @@ def run_informed_reconstruction(cfg: Dict[str, Any], root: str = "runs") -> Dict
     tgt_x, tgt_y = ds.get(splits["test_targets"])
     released = train_models_batched(cfg["released_model"], A["init_seed"], fixed_x, fixed_y, tgt_x, tgt_y,
                                     A["lr"], A["momentum"], A["epochs"], build(A.get("loss", CE_SPEC)), A.get("chunk_size", 50), device,
-                                    init_seeds=_init_seeds(A, len(tgt_x), role="released"))
+                                    init_seeds=_init_seeds(A, len(tgt_x), role="released"), dp=_dp_for(A, "released"))
     ev_x, ev_y = ds.get(splits["eval"])
     acc = accuracy_of_flat_params(cfg["released_model"], released, ev_x, ev_y, device)
 
@@ -229,7 +253,7 @@ def run_informed_reconstruction(cfg: Dict[str, Any], root: str = "runs") -> Dict
     nn = metrics.nn_oracle_mse(tgt_x, pool)
     result = {
         "name": cfg.get("name"), "n_shadow": int(len(S.arrays["params"])), "n_targets": int(len(tgt_x)),
-        "released_acc_mean": float(acc.mean()), "mse_mean": float(mse.mean()), "mse_median": float(np.median(mse)),
+        "released_acc_mean": float(acc.mean()), "dp": A.get("dp"), "dp_epsilon_delta1e-5": dp_epsilon(A), "mse_mean": float(mse.mean()), "mse_median": float(np.median(mse)),
         "nn_oracle_mse_mean": float(nn.mean()), "frac_better_than_nn": metrics.frac_better_than_nn(mse, nn),
         "shadow_record": S.record_id, "history": hist, "seconds": round(time.time() - t0, 1),
     }
