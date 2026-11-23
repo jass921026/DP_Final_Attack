@@ -1,0 +1,65 @@
+{
+  "name": "rmia_p12_itransformer",
+  "_comment": "RMIA pipeline on P12 + iTransformer (feasibility config, non-DP): 4 complementary model pairs (8 models), each trained on half of set-a (n=3992, so ~1996 patients/model); audit set 1600 (balanced for target 0) drawn from set-a; population = 1600 patients from set-b (held-out test split). flip=false: P12 is tabular time-series, not images (random_hflip would crash on this shape).",
+  "official_attacks_path": "../rmia/ml_privacy_meter/attacks.py",
+  "data": {
+    "module": "datasets.p12",
+    "type": "P12",
+    "kwargs": {
+      "mode": "values",
+      "flat": true
+    }
+  },
+  "model": {
+    "module": "models.itransformer_cls",
+    "type": "ITransformerClassifier",
+    "kwargs": {}
+  },
+  "train": {
+    "epochs": 30,
+    "batch_size": 32,
+    "lr": 0.0003,
+    "optimizer": {
+      "name": "adam",
+      "lr": 0.0003,
+      "weight_decay": 0.0001
+    },
+    "flip": false,
+    "device": "mps"
+  },
+  "models": {
+    "num_pairs": 4,
+    "seed": 0
+  },
+  "audit": {
+    "size": 1600,
+    "seed": 1
+  },
+  "population": {
+    "size": 1600,
+    "seed": 2
+  },
+  "attack": {
+    "targets": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "num_ref": [
+      1,
+      2,
+      4
+    ],
+    "gamma": [
+      1.0,
+      2.0
+    ],
+    "a": [
+      0.3,
+      "tune"
+    ],
+    "selection": "master",
+    "check_official": true
+  }
+}
