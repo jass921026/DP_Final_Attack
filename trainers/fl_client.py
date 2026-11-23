@@ -41,6 +41,32 @@ def fedsgd_gradient(model: torch.nn.Module, loss_fn: torch.nn.Module, x: torch.T
     return grads
 
 
+def dp_clipped_gradient(model: torch.nn.Module, loss_fn: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, clip: float):
+    """
+    功能
+        DP-FedSGD 客戶端的「裁剪」部分：逐筆梯度裁剪到範數 <= clip，再取平均（雜訊由呼叫端加）。
+        回傳 (平均的裁剪梯度 list, 逐筆原始梯度範數 (n,))。add/remove 鄰接下，總和的敏感度 = clip。
+    Pseudo code
+        for i in 1..n:
+            g_i <- grad l(f(x_i), y_i)
+            c_i <- min(1, clip / ||g_i||)
+        回傳 (1/n) * sum_i c_i * g_i
+    用法
+        g, norms = dp_clipped_gradient(model, loss_fn, x_norm, y, clip=1.0)    # 模型須在 eval 模式（BN 固定，樣本互相獨立）
+    """
+    n, params = len(x), list(model.parameters())
+    acc = [torch.zeros_like(p) for p in params]
+    norms = torch.zeros(n)
+    for i in range(n):                                     # [對應 Pseudo code: for i] 每筆單獨反向，累加裁剪後的梯度
+        g = torch.autograd.grad(loss_fn(model(x[i:i + 1]), y[i:i + 1]), params)
+        norm = torch.sqrt(sum((gi.double() ** 2).sum() for gi in g)).item()
+        norms[i] = norm
+        c = min(1.0, clip / (norm + 1e-12))
+        for a, gi in zip(acc, g):
+            a.add_(gi, alpha=c / n)
+    return acc, norms
+
+
 def fedavg_update(model: torch.nn.Module, loss_fn: torch.nn.Module, x: torch.Tensor, y: torch.Tensor, steps: int, per_step: int, lr: float) -> List[torch.Tensor]:
     """
     功能

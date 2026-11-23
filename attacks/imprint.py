@@ -59,7 +59,8 @@ class ImprintBlock(BaseModel):
     structure = "cumulative"
 
     def __init__(self, data_shape: Tuple[int, ...], num_bins: int, connection: str = "linear",
-                 gain: float = 1e-3, linfunc: str = "fourier", mode: int = 0, bin_dist: Optional[str] = None):
+                 gain: float = 1e-3, linfunc: str = "fourier", mode: int = 0, bin_dist: Optional[str] = None,
+                 empirical_bins: Optional[List[float]] = None):
         super().__init__()
         self.bin_dist = bin_dist        # None：官方行為（fourier -> Laplace，其他 -> 常態）；"laplace"/"normal"：明確指定（Table 1 的 Mean+Laplacian）
         self.data_shape = tuple(data_shape)
@@ -67,8 +68,9 @@ class ImprintBlock(BaseModel):
         self.num_bins = num_bins
         self.connection = connection
         self.linear0 = torch.nn.Linear(self.data_size, num_bins)
-        # [對應 Pseudo code: c_i 與 W*, b*] 分位點、線性查詢與偏置
-        self.bins = self._get_bins(linfunc)
+        # [對應 Pseudo code: c_i 與 W*, b*] 分位點、線性查詢與偏置；empirical_bins 給定時跳過常態/Laplace 假設，
+        # 改用輔助資料上 h(x) 的經驗分位點（P12 的特徵分布既非常態也非 Laplace，見 compute_empirical_bins）
+        self.bins = list(empirical_bins) if empirical_bins is not None else self._get_bins(linfunc)
         with torch.no_grad():
             self.linear0.weight.data = self._init_linear_function(linfunc, mode) * gain
             self.linear0.bias.data = self._make_biases() * gain
@@ -118,6 +120,26 @@ class ImprintBlock(BaseModel):
         else:   # addition
             out = x_in.flatten(start_dim=1) + a.mean(dim=1, keepdim=True)
         return out.unflatten(dim=1, sizes=self.data_shape)
+
+
+def compute_empirical_bins(aux_x: torch.Tensor, data_shape: Tuple[int, ...], num_bins: int,
+                            linfunc: str = "avg", mode: int = 0) -> List[float]:
+    """
+    功能
+        用輔助資料（攻擊者手上、不含目標的樣本）估計線性查詢 h(x) 的經驗等質量分位點，取代 ImprintBlock 預設的
+        常態/Laplace 假設。P12 的標準化特徵約 2/3 是補 0（遮罩），h(x) 的分布在 0 附近有尖峰，不服從那兩個假設；
+        ImageNet 的假設成立是因為標準化像素經 DCT（fourier）後近似 Laplace，一般線性查詢近似常態。
+    Pseudo code
+        h <- 與 ImprintBlock 相同的線性查詢（avg/fourier/randn，gain 無關，分位點對 gain 縮放不變）
+        c_i <- empirical quantile(h(aux_x), i/num_bins),  i = 1..num_bins-1;  c_0 = -1e4（近似 -inf）
+    用法
+        bins = compute_empirical_bins(aux_x, (13, 41), num_bins=16, linfunc="avg")
+        block = ImprintBlock((13, 41), 16, linfunc="avg", empirical_bins=bins)
+    """
+    tmp = ImprintBlock(data_shape, num_bins, linfunc=linfunc, mode=mode, gain=1.0)   # 只借用 h 的權重；gain 不影響分位點的相對位置
+    w = tmp.linear0.weight.data[0]
+    h = aux_x.reshape(aux_x.shape[0], -1).float() @ w
+    return [-1e4] + [float(torch.quantile(h, i / num_bins)) for i in range(1, num_bins)]
 
 
 class SparseImprintBlock(ImprintBlock):
@@ -192,6 +214,38 @@ def invert_cumulative(weight_grad: torch.Tensor, bias_grad: torch.Tensor,
     return rec, wd, bd, valid
 
 
+def shrinkage_reconstruct(weight_grad: torch.Tensor, bias_grad: torch.Tensor, noise_std: float, prior: torch.Tensor,
+                          prior_var: float, structure: str = "cumulative") -> torch.Tensor:
+    """
+    功能
+        closed-form `invert_cumulative` 的貝氏收縮版：不挑「一個命中的 bin」做除法、其餘 bin 整個丟掉，而是把全部
+        k 個 bin 的 (dW_i, db_i) 一起當作對同一個 x 的 k 次帶權線性量測，做加權最小平方 + 收縮到已知先驗（population
+        mean）的聯合估計。雜訊蓋過某個 bin 的訊號時，那個 bin 的權重（db_i^2）本身就很小，會自動被壓低，不需要
+        像 `invert_cumulative` 的 `bias_threshold` 那樣用硬門檻整個丟棄——這是跟使用者討論「post-processing 換 MSE」
+        時提的 Wiener filter / ridge 估計，解析解、不用訓練。
+    Pseudo code
+        目標：對同一個 x，每個 bin i 給出一次觀測 dW_i = x * db_i + N(0, noise_std^2)（cumulative 結構下，batch=1 時
+              相鄰列差分後每個有效 bin 都是對同一張輸入的獨立量測；batch>1 時個別 bin 混了不同樣本，這裡仍把它們
+              當成對「這批資料的某個聚合量」的量測，近似處理，不做跨樣本拆分）。
+        先驗：x ~ N(prior, prior_var)（prior、prior_var 來自輔助資料，population mean / variance）
+        最小化：sum_i (dW_i - db_i*x)^2 / noise_std^2 + (x - prior)^2 / prior_var
+        解（對 x 微分 = 0）：lambda <- noise_std^2 / prior_var
+                            x_hat <- (sum_i db_i*dW_i + lambda*prior) / (sum_i db_i^2 + lambda)
+    用法
+        x_hat = shrinkage_reconstruct(grads[0], grads[1], sigma*clip, prior, prior_var)   # x_hat: (D,)
+    """
+    if structure == "sparse":
+        wd, bd = weight_grad, bias_grad
+    else:
+        wd, bd = weight_grad.clone(), bias_grad.clone()
+        wd[1:] = weight_grad[1:] - weight_grad[:-1]
+        bd[1:] = bias_grad[1:] - bias_grad[:-1]
+    lam = (noise_std ** 2) / prior_var if noise_std > 0 else 0.0
+    num = (bd[:, None] * wd).sum(0) + lam * prior
+    den = (bd ** 2).sum() + lam
+    return num / den
+
+
 def select_hits(rec: torch.Tensor, wd: torch.Tensor, valid: torch.Tensor, n: int,
                 reduction: str = "weight", pad: bool = True) -> torch.Tensor:
     """
@@ -216,7 +270,8 @@ def select_hits(rec: torch.Tensor, wd: torch.Tensor, valid: torch.Tensor, n: int
 
 
 def reconstruct(grads: List[torch.Tensor], n: int, data_shape: Tuple[int, ...], weight_idx: int = 0, bias_idx: int = 1,
-                bias_threshold: float = 0.0, reduction: str = "weight", structure: str = "cumulative") -> Tuple[torch.Tensor, int]:
+                bias_threshold: float = 0.0, reduction: str = "weight", structure: str = "cumulative",
+                clip_range: Optional[Tuple[float, float]] = None) -> Tuple[torch.Tensor, int]:
     """
     功能
         伺服器端完整流程：取出 imprint 層的權重/偏置梯度 -> 差分反演 -> 篩選 -> 重塑並夾到合法像素範圍。
@@ -238,6 +293,9 @@ def reconstruct(grads: List[torch.Tensor], n: int, data_shape: Tuple[int, ...], 
     n_hits = int(valid.sum())
     rec = select_hits(rec, wd, valid, n, reduction)
     rec = rec.reshape(rec.shape[0], *data_shape)
+    if clip_range is not None:            # 一般（非像素）資料：夾到給定的 (下界, 上界)，而非 ImageNet 的正規化像素範圍
+        lo, hi = clip_range
+        return rec.clamp(lo, hi), n_hits
     mean = torch.tensor(IMAGENET_MEAN, dtype=rec.dtype)[:, None, None]
     std = torch.tensor(IMAGENET_STD, dtype=rec.dtype)[:, None, None]
     return torch.max(torch.min(rec, (1 - mean) / std), -mean / std), n_hits
@@ -356,6 +414,7 @@ def run_imprint_fedsgd(cfg: Dict[str, Any], root: str = "runs") -> Dict[str, Any
     x_norm = (x01 - mean) / std
     loss_fn = build(cfg.get("loss", {"module": "loss.cross_entropy", "type": "CrossEntropy", "kwargs": {}}))      # 客戶端的訓練損失
     blk = cfg["block"]
+    dp_sigmas = cfg["sweep"].get("dp_sigma")                           # DP-FedSGD：高斯機制的噪音倍率 sigma（雜訊 = sigma * clip，除以 n）
     noises = cfg["sweep"].get("noise", [0.0])
     thr_sd = cfg.get("attack", {}).get("bias_threshold_sd", 0.0)       # 0 = 官方（bias_grad != 0）；>0 = 雜訊感知門檻（倍數 * 2*scale）
     mates = None
@@ -380,10 +439,20 @@ def run_imprint_fedsgd(cfg: Dict[str, Any], root: str = "runs") -> Dict[str, Any
                 clean = [u.float() for u in fedavg_update(m64, loss_fn, x_norm.double(), y, cl["steps"], cl["per_step"], cl["lr"])]
             else:
                 clean = fedavg_update(model, loss_fn, x_norm, y, cl["steps"], cl["per_step"], cl["lr"])
+        elif dp_sigmas is not None:
+            from trainers.fl_client import dp_clipped_gradient
+            clean, g_norms = dp_clipped_gradient(model, loss_fn, x_norm, y, cl["clip"])
         else:
             clean = fedsgd_gradient(model, loss_fn, x_norm, y, cfg.get("micro_batch", 8))
-        for sigma in noises:
-            grads = add_gradient_noise(clean, sigma, seed=cfg.get("noise_seed", 0))
+        for sigma in (dp_sigmas if dp_sigmas is not None else noises):
+            if dp_sigmas is not None:
+                from util.gdp import gdp_epsilon
+                eps = gdp_epsilon(1.0 / sigma, cfg.get("delta", 1e-5)) if sigma > 0 else float("inf")      # 單次高斯機制 mu = 1/sigma
+                scale = sigma * cl["clip"] / n
+                grads = add_gradient_noise(clean, scale, seed=cfg.get("noise_seed", 0), distribution="gaussian") if sigma > 0 else clean
+                sigma_dp, sigma = sigma, scale                                                            # 之後的 sigma 一律是加在梯度上的雜訊尺度
+            else:
+                grads = add_gradient_noise(clean, sigma, seed=cfg.get("noise_seed", 0))
             # [對應 Pseudo code: x_hat 與 指標]
             thr = thr_sd * 2 * sigma if sigma > 0 else 0.0
             rec, n_hits = reconstruct(grads, n, tuple(x01.shape[1:]), bias_threshold=thr, reduction=cfg.get("attack", {}).get("reduction", "weight"),
@@ -391,6 +460,9 @@ def run_imprint_fedsgd(cfg: Dict[str, Any], root: str = "runs") -> Dict[str, Any
             rec01 = (rec * std + mean).clamp(0, 1)
             stats, _ = best_match_psnr(rec01, x01)
             row = {"num_bins": k, "noise": sigma, "n_hits": n_hits, "theory_perfect": expected_perfect_fraction(n, k), **stats}
+            if dp_sigmas is not None:
+                row.update({"dp_sigma": sigma_dp, "epsilon": eps, "clip": cl["clip"], "grad_norm_median": float(g_norms.median()),
+                            "frac_clipped": float((g_norms > cl["clip"]).float().mean())})
             if mates is not None:
                 row["iip"] = iip_score(rec01, x01, y, mates[0], mates[1])
             rows.append(row)

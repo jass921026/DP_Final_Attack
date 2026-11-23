@@ -21,7 +21,7 @@
 快速路徑：模型為 models.mlp.MLP 時，改用手寫的批次矩陣乘法（固定集只做一次 GEMM，不為每個模型複製），
 記憶體與時間都遠低於 vmap 版本；數學上與 vmap 版本相同（tests/test_batched_gd.py 比對兩者）。vmap 版本是通用的參考實作。
 DP-GD 版本（dp={"clip": C, "sigma": 噪音倍數, "seed": 整數}）：每步 g <- (sum_i clip_C(g_i) + N(0, (sigma C)^2 I)) / (n+1)（全批次、無子抽樣、add/remove 鄰接），
-只在 MLP 快速路徑提供（逐樣本梯度範數用「幽靈範數」：||dW_i||^2 = ||delta_i||^2 ||a_i||^2，不實體化逐樣本梯度；tests/test_dp_gd.py 以 vmap 逐樣本梯度與 Opacus 驗證）。
+MLP 快速路徑（逐樣本梯度範數用「幽靈範數」：||dW_i||^2 = ||delta_i||^2 ||a_i||^2，不實體化逐樣本梯度；tests/test_dp_gd.py 以 vmap 逐樣本梯度與 Opacus 驗證）；其他模型（如 iTransformer）走通用 vmap 路徑，實體化逐樣本梯度（fast=False 的 MLP 與快速路徑一致，同測試檔驗證）。
 """
 from typing import Any, Dict, Optional
 
@@ -204,7 +204,7 @@ def train_models_batched(
         給定長度 = 模型數的整數陣列：第 i 個模型用 init_seeds[i] 各自初始化（論文 Table II「Adversary does not know initial parameters」）。
     """
     if dp is not None and not (fast if fast is not None else (model_spec.get("module") == "models.mlp" and model_spec.get("type") == "MLP")):
-        raise NotImplementedError("DP-GD is only implemented for the MLP fast path.")
+        pass                                                   # 其他模型：通用 vmap 路徑（逐樣本梯度實體化，較慢）
 
     # [對應 Pseudo code: theta_0 <- init(init_seed)] 以固定種子建立基底模型，所有模型共用其初始參數
     torch.manual_seed(init_seed)
@@ -219,6 +219,19 @@ def train_models_batched(
     # [對應 Pseudo code: grad_theta L] 單一模型的梯度函數，對「模型維度」做 vmap 以平行處理 chunk 內所有模型
     loss_fn = loss_fn.to(device)
     batched_grad = vmap(grad(_make_loss(base, loss_fn, fx, fy)), in_dims=(0, 0, 0))
+
+    if dp is not None:
+        def _one(pp, x, y):
+            return loss_fn.per_sample(functional_call(base, pp, (x[None],)), y[None]).sum()
+        clip_c = float(dp["clip"])
+
+        def dp_one(pp, z_x, z_y):
+            X, Y = torch.cat([fx, z_x[None]]), torch.cat([fy, z_y[None]])
+            g = vmap(grad(_one), in_dims=(None, 0, 0))(pp, X, Y)             # 逐樣本梯度 (n+1, ...)
+            norms = torch.sqrt(sum((v.reshape(len(X), -1) ** 2).sum(1) for v in g.values()))
+            c = (clip_c / (norms + 1e-12)).clamp(max=1.0)
+            return {k: (v * c.reshape(-1, *([1] * (v.dim() - 1)))).sum(0) / len(X) for k, v in g.items()}
+        batched_dp_grad = vmap(dp_one, in_dims=(0, 0, 0))
 
     use_fast = fast if fast is not None else (model_spec.get("module") == "models.mlp" and model_spec.get("type") == "MLP")
     if use_fast:
@@ -258,8 +271,12 @@ def train_models_batched(
             out.append(torch.cat([params[k].reshape(b, -1) for k in theta0], dim=1).cpu())
             continue
         # [對應 Pseudo code: repeat epochs 次] 全批次更新（通用 vmap 路徑）
+        gen = torch.Generator().manual_seed(int(dp.get("seed", 0)) * 1_000_003 + s) if dp is not None else None
         for _ in range(epochs):
-            g = batched_grad(params, zx, zy)
+            g = batched_dp_grad(params, zx, zy) if dp is not None else batched_grad(params, zx, zy)
+            if dp is not None and float(dp.get("sigma", 0.0)) > 0:       # 加高斯雜訊 N(0, (sigma C)^2) / (n+1)
+                nz = float(dp["sigma"]) * float(dp["clip"]) / (len(fx) + 1)
+                g = {k: v + nz * torch.randn(v.shape, generator=gen).to(v.device) for k, v in g.items()}
             for k in params:
                 vel[k] = g[k] + momentum * vel[k]           # v <- g + momentum * v
                 params[k] = params[k] - lr * vel[k]         # theta <- theta - lr * v

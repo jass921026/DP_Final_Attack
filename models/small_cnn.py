@@ -17,9 +17,10 @@ from torch import nn
 from models.base import BaseModel
 
 
-def _block(cin: int, cout: int, pool: bool) -> nn.Sequential:
-    """功能：Conv3x3 - BN - ReLU（可選 2x2 最大池化）。"""
-    layers = [nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True)]
+def _block(cin: int, cout: int, pool: bool, norm: str = "batch") -> nn.Sequential:
+    """功能：Conv3x3 - BN（或 GroupNorm，DP-SGD 用）- ReLU（可選 2x2 最大池化）。"""
+    nl = nn.BatchNorm2d(cout) if norm == "batch" else nn.GroupNorm(8, cout)
+    layers = [nn.Conv2d(cin, cout, 3, padding=1, bias=False), nl, nn.ReLU(inplace=(norm == "batch"))]
     if pool:
         layers.append(nn.MaxPool2d(2))
     return nn.Sequential(*layers)
@@ -36,11 +37,11 @@ class SmallCNN(BaseModel):
         SmallCNN(width=64, num_classes=10)
     """
 
-    def __init__(self, width: int = 64, num_classes: int = 10):
+    def __init__(self, width: int = 64, num_classes: int = 10, norm: str = "batch"):
         super().__init__()
         w = width
         # [對應 Pseudo code: h]
-        self.features = nn.Sequential(_block(3, w, False), _block(w, 2 * w, True), _block(2 * w, 4 * w, True), _block(4 * w, 4 * w, True))
+        self.features = nn.Sequential(_block(3, w, False, norm), _block(w, 2 * w, True, norm), _block(2 * w, 4 * w, True, norm), _block(4 * w, 4 * w, True, norm))
         # [對應 Pseudo code: logits]
         self.head = nn.Linear(4 * w, num_classes)
 

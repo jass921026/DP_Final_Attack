@@ -96,3 +96,14 @@ def test_training_loop_clip_huge_equals_plain():
     a = train_models_batched(SPEC, 7, fx, fy, zx, zy, 0.1, 0.9, 20, CE, chunk_size=2)
     b = train_models_batched(SPEC, 7, fx, fy, zx, zy, 0.1, 0.9, 20, CE, chunk_size=2, dp={"clip": 1e9, "sigma": 0.0, "seed": 0})
     assert np.allclose(a, b, atol=1e-5), np.abs(a - b).max()
+
+
+def test_generic_vmap_dp_path_matches_mlp_fast_path():
+    rng = np.random.default_rng(1)
+    fx = rng.random((25, 16)).astype(np.float32); fy = rng.integers(0, 4, 25)
+    zx = rng.random((3, 16)).astype(np.float32) * 3; zy = rng.integers(0, 4, 3)
+    for sigma in (0.0, 1.5):
+        dp = {"clip": 0.4, "sigma": sigma, "seed": 3}
+        a = train_models_batched(SPEC, 7, fx, fy, zx, zy, 0.1, 0.9, 10, CE, chunk_size=3, dp=dp, fast=True)
+        b = train_models_batched(SPEC, 7, fx, fy, zx, zy, 0.1, 0.9, 10, CE, chunk_size=3, dp=dp, fast=False)
+        assert np.allclose(a, b, atol=1e-5), (sigma, np.abs(a - b).max())     # 雜訊用同一個隨機流，兩條路徑應完全一致

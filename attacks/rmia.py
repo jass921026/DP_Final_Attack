@@ -41,7 +41,8 @@ def softmax_true_class(logits: torch.Tensor, labels: torch.Tensor, temp: float =
 
 
 @torch.no_grad()
-def model_signals(model: torch.nn.Module, dataset, indices=None, device: str = "cpu", batch_size: int = 1000, temp: float = 1.0) -> np.ndarray:
+def model_signals(model: torch.nn.Module, dataset, indices=None, device: str = "cpu", batch_size: int = 1000, temp: float = 1.0,
+                  move: bool = True) -> np.ndarray:
     """
     功能
         模型在資料集（torch Dataset，可指定索引子集）上的 MIA 訊號：以 DataLoader 逐批取資料，算真實類別 softmax。
@@ -50,10 +51,19 @@ def model_signals(model: torch.nn.Module, dataset, indices=None, device: str = "
         return concat(signal_b)
     用法
         sig = model_signals(model, train_ds, audit_idx, "mps")     # (n,1)
+        move=False：假設模型已經在 device 上且呼叫端會自己管理（例如同一個模型要連續算好幾次訊號時，省掉
+        每次呼叫都把整個模型搬到 device、算完又搬回 cpu 的來回搬移；MPS/CUDA 上這個搬移本身就要花時間）。
+        batch_size 相同時結果與 move=True 逐位元相同（搬不搬不影響數值），見 tests/test_rmia_fast.py。
+    注意
+        batch_size 改變時（例如 fast 路徑常用更大的推論 batch）結果只會數值上一致，到 float32 的捨入誤差
+        （矩陣乘法內部加總順序不同），不是逐位元相同。
     """
-    model = model.to(device).eval()
+    if move:
+        model = model.to(device)
+    model.eval()
     out = [softmax_true_class(model(xb.to(device)), yb.to(device), temp) for xb, yb in make_loader(dataset, indices, batch_size)]
-    model.cpu()
+    if move:
+        model.cpu()
     return np.concatenate(out)
 
 
