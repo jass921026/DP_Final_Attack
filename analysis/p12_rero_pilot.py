@@ -1,15 +1,18 @@
 """
 檔案功能
 --------
-P12 + iTransformer 上 Balle 重建攻擊（ReRo）的可行性試驗（小規模）：
+P12 上 Balle 重建攻擊（ReRo）的可行性試驗（小規模）：
     D- = 500 筆固定資料；演算法 A = 確定性全批次 GD（共用初始化、無 dropout）；
     影子模型 A(D- ∪ {z_i})，z_i 來自對手的資料池；釋出模型 A(D- ∪ {z})，z 為測試目標。
     攻擊：參數標準化後以核（對偶）嶺迴歸預測標準化的 z（線性攻擊，比 ReCoNN 便宜，用來判斷「參數裡有沒有訊號」）。
     指標：MSE 與先驗（影子目標的平均）的 MSE 之比、目標在候選池中的排名分位（越小越好，無資訊約均勻）。
+--model：原本只有 iTransformer；跟 analysis/p12_model_sweep.py 共用同一組架構（iTransformer/SUMMIT/MLP/GRU），
+    SUMMIT 用 mode="values_mask"（D=13*82），其餘三個用 mode="values"（D=13*41）。輸出路徑的 tag 前面加
+    `<model>_` 以免四個架構互相覆蓋。
 使用方式
 --------
-    python -m analysis.p12_rero_pilot [--shadows 1000] [--targets 200] [--steps 100] [--lr 0.03] [--fixed 500] [--clip C --sigma S]
-    輸出：analysis_out/p12_rero/<tag>/models.npz（可續跑）、summary.json
+    python -m analysis.p12_rero_pilot --model itransformer [--shadows 1000] [--targets 200] [--steps 100] [--lr 0.03] [--fixed 500] [--clip C --sigma S]
+    輸出：analysis_out/p12_rero/<model>_<tag>/{shadow,released}.npz（可續跑）、summary.json
 """
 import argparse
 import json
@@ -24,11 +27,20 @@ from sklearn.metrics import roc_auc_score
 from trainers.batched_gd import accuracy_of_flat_params, train_models_batched
 from util.registry import build
 
-SPEC = {"module": "models.itransformer_cls", "type": "ITransformerClassifier", "kwargs": {}}
+MODEL_SPECS = {
+    "itransformer": {"spec": {"module": "models.itransformer_cls", "type": "ITransformerClassifier", "kwargs": {}}, "mode": "values"},
+    "summit": {"spec": {"module": "models.summit_cls", "type": "SUMMITClassifier", "kwargs": {}}, "mode": "values_mask"},
+    "mlp": {"spec": {"module": "models.mlp", "type": "MLP", "kwargs": {"in_dim": 533, "out_dim": 2, "hidden": [256, 128], "activation": "relu"}}, "mode": "values"},
+    "gru": {"spec": {"module": "models.gru_cls", "type": "GRUClassifier", "kwargs": {}}, "mode": "values"},
+}
 CE = {"module": "loss.cross_entropy", "type": "CrossEntropy", "kwargs": {}}
 
 
-def train_chunks(fx, fy, zx, zy, a, tag, out):
+def get_data_shape(mode: str) -> int:
+    return 13 * 41 * (2 if mode == "values_mask" else 1)
+
+
+def train_chunks(spec, fx, fy, zx, zy, a, tag, out):
     dp = {"clip": a.clip, "sigma": a.sigma, "seed": a.dp_seed} if a.clip > 0 else None
     path = os.path.join(out, f"{tag}.npz")
     if os.path.exists(path):
@@ -39,7 +51,7 @@ def train_chunks(fx, fy, zx, zy, a, tag, out):
         parts = [np.load(part)]; done = len(parts[0])
     t0 = time.time()
     for s in range(done, len(zx), 100):
-        P = train_models_batched(SPEC, 42, fx, fy, zx[s:s + 100], zy[s:s + 100], a.lr, 0.9, a.steps, build(CE), chunk_size=a.chunk, device=a.device, dp=dp)
+        P = train_models_batched(spec, 42, fx, fy, zx[s:s + 100], zy[s:s + 100], a.lr, 0.9, a.steps, build(CE), chunk_size=a.chunk, device=a.device, dp=dp)
         parts.append(P); np.save(part, np.concatenate(parts))
         print(f"{tag}: {s + len(P)}/{len(zx)}  {time.time() - t0:.0f}s", flush=True)
     P = np.concatenate(parts)
@@ -49,6 +61,7 @@ def train_chunks(fx, fy, zx, zy, a, tag, out):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="itransformer", choices=list(MODEL_SPECS.keys()))
     ap.add_argument("--shadows", type=int, default=1000); ap.add_argument("--targets", type=int, default=200)
     ap.add_argument("--fixed", type=int, default=500); ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--lr", type=float, default=0.03); ap.add_argument("--chunk", type=int, default=16)
@@ -56,15 +69,16 @@ def main():
     ap.add_argument("--sigma", type=float, default=0.0); ap.add_argument("--dp-seed", type=int, default=0)
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     a = ap.parse_args()
-    tag = f"f{a.fixed}_s{a.shadows}_t{a.targets}_T{a.steps}_lr{a.lr}" + (f"_dpC{a.clip}_sig{a.sigma}" if a.clip > 0 else "")
+    SPEC, mode = MODEL_SPECS[a.model]["spec"], MODEL_SPECS[a.model]["mode"]
+    tag = f"{a.model}_f{a.fixed}_s{a.shadows}_t{a.targets}_T{a.steps}_lr{a.lr}" + (f"_dpC{a.clip}_sig{a.sigma}" if a.clip > 0 else "")
     out = os.path.join("analysis_out", "p12_rero", tag); os.makedirs(out, exist_ok=True)
-    ds = build({"module": "datasets.p12", "type": "P12", "kwargs": {"split": "all", "mode": "values", "flat": True}})
+    ds = build({"module": "datasets.p12", "type": "P12", "kwargs": {"split": "all", "mode": mode, "flat": True}})
     perm = np.random.default_rng(0).permutation(len(ds.x))
     i_fix, i_sh = perm[:a.fixed], perm[a.fixed:a.fixed + a.shadows]
     i_te, i_ev = perm[a.fixed + a.shadows:a.fixed + a.shadows + a.targets], perm[-1000:]
     fx, fy, sx, sy, tx, ty = ds.x[i_fix], ds.y[i_fix], ds.x[i_sh], ds.y[i_sh], ds.x[i_te], ds.y[i_te]
-    Ps = train_chunks(fx, fy, sx, sy, a, "shadow", out)
-    Pt = train_chunks(fx, fy, tx, ty, a, "released", out)
+    Ps = train_chunks(SPEC, fx, fy, sx, sy, a, "shadow", out)
+    Pt = train_chunks(SPEC, fx, fy, tx, ty, a, "released", out)
     # 效用：釋出模型在評估集上的 AUROC
     m = build(SPEC); aucs = []
     for p in Pt[:10]:

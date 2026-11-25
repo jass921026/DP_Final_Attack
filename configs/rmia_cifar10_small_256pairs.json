@@ -1,0 +1,81 @@
+{
+  "name": "rmia_cifar10_small_256pairs",
+  "_comment": "rmia_cifar10_small.json 的 256 pairs 版(512 個模型,每個在 50000 張訓練圖的一半上訓練):目標 16 個、num_ref 到 255(上限 = (512-2)/2)。訓練成本約為 9 pairs 版的 28 倍;audit 20000 x population 10000 的攻擊階段成本隨 targets x num_ref 增加，可縮短清單。其餘設定(資料、模型、訓練、audit/population 切分)與原 config 相同。",
+  "official_attacks_path": "../rmia/ml_privacy_meter/attacks.py",
+  "data": {
+    "module": "datasets.cifar10",
+    "type": "CIFAR10",
+    "kwargs": {
+      "cache_dir": "data_cache"
+    }
+  },
+  "model": {
+    "module": "models.small_cnn",
+    "type": "SmallCNN",
+    "kwargs": {
+      "width": 64,
+      "num_classes": 10
+    }
+  },
+  "train": {
+    "epochs": 20,
+    "lr": 0.05,
+    "batch_size": 256,
+    "momentum": 0.9,
+    "weight_decay": 0.0,
+    "device": "mps"
+  },
+  "models": {
+    "num_pairs": 256,
+    "seed": 0
+  },
+  "audit": {
+    "size": 20000,
+    "seed": 1
+  },
+  "population": {
+    "size": 10000,
+    "seed": 2
+  },
+  "attack": {
+    "targets": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "num_ref": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      255
+    ],
+    "gamma": [
+      1.0,
+      2.0
+    ],
+    "a": [
+      0.3,
+      "tune"
+    ],
+    "selection": "master",
+    "check_official": true
+  }
+}

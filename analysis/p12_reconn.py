@@ -1,12 +1,14 @@
 """
 檔案功能
 --------
-P12 + iTransformer 上以 ReCoNN（MLP 重建網路，Balle 2022 Sec. IV-B）取代 p12_rero_pilot 的線性核嶺迴歸。
-讀 analysis_out/p12_rero/<tag>/{shadow,released}.npz（同一批影子/釋出模型），參數逐座標標準化後訓練 MLP
-預測標準化的目標；影子集的後 20% 當留出集，保留留出 MSE 最低的 epoch。指標與線性版相同。
+P12 上以 ReCoNN（MLP 重建網路，Balle 2022 Sec. IV-B）取代 p12_rero_pilot 的線性核嶺迴歸。
+讀 analysis_out/p12_rero/<tag>/{shadow,released}.npz（同一批影子/釋出模型，`p12_rero_pilot.py` 產生），參數
+逐座標標準化後訓練 MLP 預測標準化的目標；影子集的後 20% 當留出集，保留留出 MSE 最低的 epoch。指標與線性版相同。
+--model 必須跟產生 <tag> 時用的 `p12_rero_pilot.py --model` 一致（決定資料集的 mode，SUMMIT 是
+"values_mask"，其餘是 "values"），否則 tx/sx/fx 的維度會跟 shadow/released.npz 內的 D 對不上。
 使用方式
 --------
-    python -m analysis.p12_reconn [--tag f500_s1000_t200_T100_lr0.03] [--hidden 1000 1000] [--epochs 200] [--subset all|<k>]
+    python -m analysis.p12_reconn --model itransformer --tag itransformer_f500_s1000_t200_T100_lr0.03 [--hidden 1000 1000] [--epochs 200] [--subset all|<k>]
     --subset k：只取變異最大的 k 個座標（降維）。輸出 summary_reconn_<name>.json
 """
 import argparse
@@ -18,10 +20,13 @@ import torch
 
 from util.registry import build
 
+DATA_MODE = {"itransformer": "values", "summit": "values_mask", "mlp": "values", "gru": "values"}
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="f500_s1000_t200_T100_lr0.03"); ap.add_argument("--fixed", type=int, default=500)
+    ap.add_argument("--model", default="itransformer", choices=list(DATA_MODE.keys()))
+    ap.add_argument("--tag", default="itransformer_f500_s1000_t200_T100_lr0.03"); ap.add_argument("--fixed", type=int, default=500)
     ap.add_argument("--shadows", type=int, default=1000); ap.add_argument("--targets", type=int, default=200)
     ap.add_argument("--hidden", type=int, nargs="+", default=[1000, 1000]); ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--bs", type=int, default=32); ap.add_argument("--wd", type=float, default=0.0)
@@ -30,7 +35,7 @@ def main():
     a = ap.parse_args()
     out = os.path.join("analysis_out", "p12_rero", a.tag)
     Ps, Pt = np.load(os.path.join(out, "shadow.npz"))["params"], np.load(os.path.join(out, "released.npz"))["params"]
-    ds = build({"module": "datasets.p12", "type": "P12", "kwargs": {"split": "all", "mode": "values", "flat": True}})
+    ds = build({"module": "datasets.p12", "type": "P12", "kwargs": {"split": "all", "mode": DATA_MODE[a.model], "flat": True}})
     perm = np.random.default_rng(0).permutation(len(ds.x))             # 與 p12_rero_pilot 相同的切分
     i_fix, i_sh = perm[:a.fixed], perm[a.fixed:a.fixed + a.shadows]
     i_te = perm[a.fixed + a.shadows:a.fixed + a.shadows + a.targets]
